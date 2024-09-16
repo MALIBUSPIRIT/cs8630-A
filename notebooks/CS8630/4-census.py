@@ -1,18 +1,16 @@
 import pandas as pd
 import requests
-
 from bokeh.io import show, output_file
-from bokeh.models import ColorBar, LogColorMapper, HoverTool
-from bokeh.palettes import Viridis6 as palette
+from bokeh.models import (
+    ColorBar, LinearColorMapper, GeoJSONDataSource, HoverTool, LogColorMapper
+)
+from bokeh.palettes import Viridis256 as palette
 from bokeh.plotting import figure
-from bokeh.sampledata.us_states import data as states
-# Add a color bar
-from bokeh.models import LinearColorMapper
+import json
 
-# API endpoint for 2020 state population data
-url = "https://api.census.gov/data/2020/dec/pl?get=P1_001N,NAME&for=state:*"
-
-response = requests.get(url)
+# Step 1: Obtain Census Data
+census_url = "https://api.census.gov/data/2020/dec/pl?get=P1_001N,NAME&for=state:*"
+response = requests.get(census_url)
 data = response.json()
 
 # Convert the data into a pandas DataFrame
@@ -21,60 +19,91 @@ rows = data[1:]
 df = pd.DataFrame(rows, columns=columns)
 
 # Rename columns for clarity
-df.rename(columns={'P1_001N': 'population', 'NAME': 'state'}, inplace=True)
+df.rename(columns={'P1_001N': 'population', 'NAME': 'state_name'}, inplace=True)
 
 # Convert population to integer
 df['population'] = df['population'].astype(int)
 
+# Standardize state names to title case
+df['state_name'] = df['state_name'].str.title()
 
+# Step 2: Load GeoJSON Data for US States
+geojson_url = 'https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json'
+geojson_response = requests.get(geojson_url)
+us_states_geo = geojson_response.json()
 
-# Remove states not in the contiguous U.S.
-excluded_states = ["AK", "HI", "PR"]
-states = {code: state for code, state in states.items() if code not in excluded_states}
+# Remove Alaska, Hawaii, and Puerto Rico if desired
+states_to_exclude = ['Alaska', 'Hawaii', 'Puerto Rico']
+us_states_geo['features'] = [
+    feature for feature in us_states_geo['features']
+    if feature['properties']['name'] not in states_to_exclude
+]
 
-# Map state names to their codes
-state_xs = [state["lons"] for state in states.values()]
-state_ys = [state["lats"] for state in states.values()]
-state_names = [state["name"] for state in states.values()]
-state_abbrevs = list(states.keys())
+# Create a mapping from state names to populations
+state_populations = df.set_index('state_name')['population'].to_dict()
 
-# Create a DataFrame for the map data
-map_data = pd.DataFrame({
-    'state_code': state_abbrevs,
-    'state_name': state_names,
-    'x': state_xs,
-    'y': state_ys
-})
+# Add population data to GeoJSON properties
+for feature in us_states_geo['features']:
+    state_name = feature['properties']['name']
+    population = state_populations.get(state_name, 0)
+    feature['properties']['population'] = population
 
-# Merge with the census data
-merged_data = pd.merge(map_data, df, how='left', left_on='state_name', right_on='state')
+# Convert GeoJSON to a GeoJSONDataSource
+geosource = GeoJSONDataSource(geojson=json.dumps(us_states_geo))
 
-
-# Reverse the palette so higher populations are darker
+# Step 3: Create the Bokeh Visualization
 palette = tuple(reversed(palette))
 
-# Create a color mapper
-color_mapper = LogColorMapper(palette=palette)
+# Choose between Linear or Log Color Mapper
+use_log_color_mapper = False  # Set to True if you prefer logarithmic scaling
+
+if use_log_color_mapper:
+    color_mapper = LogColorMapper(
+        palette=palette,
+        low=df['population'].min(),
+        high=df['population'].max()
+    )
+else:
+    color_mapper = LinearColorMapper(
+        palette=palette,
+        low=df['population'].min(),
+        high=df['population'].max()
+    )
 
 # Create the figure
-p = figure(title="2020 U.S. Census Population by State", 
-           toolbar_location="left", plot_width=800, plot_height=500)
+p = figure(
+    title="2020 U.S. Census Population by State",
+    toolbar_location="left",
+    tools="pan,wheel_zoom,reset",
+    width=800,
+    height=500,
+    match_aspect=True
+)
 
 # Add patches representing states
-p.patches('x', 'y', source=merged_data,
-          fill_color={'field': 'population', 'transform': color_mapper},
-          fill_alpha=0.7, line_color="white", line_width=0.5)
+p.patches(
+    'xs',
+    'ys',
+    source=geosource,
+    fill_color={'field': 'population', 'transform': color_mapper},
+    fill_alpha=0.7,
+    line_color="white",
+    line_width=0.5
+)
 
 # Add a hover tool
 p.add_tools(HoverTool(tooltips=[
-    ("State", "@state_name"),
+    ("State", "@name"),
     ("Population", "@population{,}"),
 ]))
 
-
-
-color_bar = ColorBar(color_mapper=color_mapper, location=(0, 0),
-                     ticker={'base': 10, 'desired_num_ticks': 10})
+# Add a color bar without specifying the ticker
+color_bar = ColorBar(
+    color_mapper=color_mapper,
+    location=(0, 0),
+    label_standoff=12,
+    border_line_color=None
+)
 p.add_layout(color_bar, 'right')
 
 # Output the visualization
